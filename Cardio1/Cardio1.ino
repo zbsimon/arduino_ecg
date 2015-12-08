@@ -39,6 +39,8 @@ void setup() {
   // we copy in new data to buff and when we display it out so we only write
   // it once per update.)
 
+  analogReadResolution(12);
+
   pinMode(ecg_input_pin, INPUT);
 
   Serial.begin(9600);
@@ -111,11 +113,19 @@ void adcCalibrate() {
 	PDB_SC_PRESCALER(7)      Prescaler = 128
 	PDB_SC_MULT(1)           Prescaler multiplication factor = 10
 */
+#define PDB_PRESCALE 7
+#define PDB_MULT_VAL 1
 #define PDB_CONFIG (PDB_SC_TRGSEL(15) | PDB_SC_PDBEN | PDB_SC_PDBIE \
-	| PDB_SC_CONT | PDB_SC_PRESCALER(7) | PDB_SC_MULT(1))
+	| PDB_SC_CONT | PDB_SC_PRESCALER(PDB_PRESCALE) | PDB_SC_MULT(PDB_MULT_VAL))
 
+
+
+// we already have the frequency we want stored in sample_rate
+// which is 250.
 // 48 MHz / 128 / 10 / 1 Hz = 37500
-#define PDB_PERIOD (F_BUS / 128 / 10 / 1)
+// #define PDB_PERIOD (F_BUS / 128 / 10 / 1)
+#define PDB_PERIOD (F_BUS / 128 / 10 / sample_rate)
+
 
 void pdbInit() {
 
