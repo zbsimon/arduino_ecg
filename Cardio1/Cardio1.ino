@@ -10,10 +10,15 @@
 static int sample_rate = 250; // in Hz
 
 static int ecg_input_pin = 13;
+
 #define TFT_DC 9
 #define TFT_CS 10
 
+#define PDB_CH0C1_TOS 0x0100
+#define PDB_CH0C1_EN 0x01
 
+// buffer to store ADC output during dma
+uint16_t samples[16];
 
 // Use hardware SPI (on Uno, #13, #12, #11) and the above for CS/DC
 ILI9341_t3 tft = ILI9341_t3(TFT_CS, TFT_DC);
@@ -174,17 +179,12 @@ void dmaInit() {
 void adc0_isr() {
 	Serial.print("adc isr: ");
 	Serial.println(millis());
-	for (uint16_t i = 0; i < 16; i++) {
-		if (i != 0) Serial.print(", ");
-		Serial.print(samples[i]);
-	}
 	Serial.println(" ");
 }
 
 void pdb_isr() {
 	Serial.print("pdb isr: ");
 	Serial.println(millis());
-	digitalWrite(13, (ledOn = !ledOn));
 	// Clear interrupt flag
 	PDB0_SC &= ~PDB_SC_PDBIF;
 }
