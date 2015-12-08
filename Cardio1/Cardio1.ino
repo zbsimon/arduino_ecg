@@ -23,6 +23,7 @@ const int max_height = 240;
 
 void setup() {
 
+  // setup lcd
   tft.begin(); // Initialize the display
   tft.setRotation(1); //  0 or 2) width = width, 1 or 3) width = height, swapped etc.
   // register  timer to fire every sample rate
@@ -33,13 +34,8 @@ void setup() {
   // we copy in new data to buff and when we display it out so we only write
   // it once per update.)
 
-  // setup lcd
+  pinMode(ecg_input_pin, INPUT);
 
-  // setup adc
-
-  // setup timer
-
-  // setup ecg input
   Serial.begin(9600);
   while (!Serial); // wait until the serial debug window is opened
 
@@ -49,7 +45,7 @@ void setup() {
 }
 
 void loop() {
-
+  // should only have to do some lcd stuff here.
 }
 
 
@@ -79,7 +75,7 @@ void adcInit() {
 	Serial.println("calibrated");
 
 	// Enable ADC interrupt, configure pin
-	ADC0_SC1A = ADC_SC1_AIEN | channel2sc1a[3];
+	ADC0_SC1A = ADC_SC1_AIEN | ecg_input_pin;
 	NVIC_ENABLE_IRQ(IRQ_ADC0);
 }
 
@@ -117,7 +113,6 @@ void adcCalibrate() {
 #define PDB_PERIOD (F_BUS / 128 / 10 / 1)
 
 void pdbInit() {
-	pinMode(13, OUTPUT);
 
 	// Enable PDB clock
 	SIM_SCGC6 |= SIM_SCGC6_PDB;
