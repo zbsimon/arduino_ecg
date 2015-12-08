@@ -9,7 +9,7 @@
 
 static int sample_rate = 250; // in Hz
 
-static int ecg_input_pin = 13;
+static int ecg_input_pin = 14;
 
 #define TFT_DC 9
 #define TFT_CS 10
@@ -18,7 +18,12 @@ static int ecg_input_pin = 13;
 #define PDB_CH0C1_EN 0x01
 
 // buffer to store ADC output during dma
-uint16_t samples[16];
+
+
+// We choke when it's this large, but I think we need this much
+// space!
+//uint16_t samples[30 * 250];
+uint16_t samples[100];
 
 // Use hardware SPI (on Uno, #13, #12, #11) and the above for CS/DC
 ILI9341_t3 tft = ILI9341_t3(TFT_CS, TFT_DC);
@@ -26,18 +31,13 @@ ILI9341_t3 tft = ILI9341_t3(TFT_CS, TFT_DC);
 const int max_width = 320;
 const int max_height = 240;
 
+bool dma_occurred = false;  // flag to know in loop when we recieved fresh data
+
 void setup() {
 
   // setup lcd
   tft.begin(); // Initialize the display
-  tft.setRotation(1); //  0 or 2) width = width, 1 or 3) width = height, swapped etc.
-  // register  timer to fire every sample rate
-  // in interupt handler, copy ecg into adc buffer
-  // when adc finished interupt fires, copy data into "userspace" buff
-  // in loop, just look at this "userspace" buff each time through loop
-  // and update lcd if it's changed (prolly just wanna set flag each time
-  // we copy in new data to buff and when we display it out so we only write
-  // it once per update.)
+  tft.setRotation(1); //  0 or 2) width = width, 1 or 3) width = height, swapped etc
 
   analogReadResolution(12);
 
@@ -49,10 +49,37 @@ void setup() {
   adcInit();
   pdbInit();
   dmaInit();
+
+  initialize_lcd_graph();
+
+
+
 }
 
 void loop() {
-  // should only have to do some lcd stuff here.
+
+  // need to wait for data to stabilize?
+  // neet to wait for button to be pressed?
+  if (dma_occurred) {
+    dma_occurred = false;
+    Serial.print("SAMPLES[0]:");
+    Serial.println(samples[0]);
+    update_lcd_graph();
+  }
+
+}
+
+// TODO
+void initialize_lcd_graph() {
+  // draw lines
+
+  // 1
+
+}
+
+// TODO
+void update_lcd_graph() {
+
 }
 
 
@@ -186,22 +213,26 @@ void dmaInit() {
 }
 
 
+// remember to set flags so we can tell when a dma has occurred
+
+
 void adc0_isr() {
-	Serial.print("adc isr: ");
-	Serial.println(millis());
-	Serial.println(" ");
+  // Serial.print("adc isr: ");
+  // Serial.println(millis());
+  // Serial.println(" ");
 }
 
 void pdb_isr() {
-	Serial.print("pdb isr: ");
-	Serial.println(millis());
-	// Clear interrupt flag
-	PDB0_SC &= ~PDB_SC_PDBIF;
+  // Serial.print("pdb isr: ");
+  // Serial.println(millis());
+  // Clear interrupt flag
+  PDB0_SC &= ~PDB_SC_PDBIF;
 }
 
 void dma_ch1_isr() {
-	Serial.print("dma isr: ");
-	Serial.println(millis());
-	// Clear interrupt request for channel 1
-	DMA_CINT = 1;
+  Serial.print("dma isr: ");
+  Serial.println(millis());
+  // Clear interrupt request for channel 1
+  DMA_CINT = 1;
+  dma_occurred = true;
 }
