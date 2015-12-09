@@ -4,12 +4,19 @@
 
 #include <Wire.h>
 #include <SPI.h>
-#include <SD.h>
+#include <SdFat.h> // enable reading SD card on TFT
 #include "ILI9341_t3.h"
+
+#define SD_CS 21
 
 static int sample_rate = 250; // in Hz
 
-static int ecg_input_pin = 14;
+static int ecg_input_pin = 17;
+
+static const uint8_t channel2sc1a[] = {
+	5, 14, 8, 9, 13, 12, 6, 7, 15, 4,
+	0, 19, 3, 21, 26, 22
+};
 
 #define TFT_DC 9
 #define TFT_CS 10
@@ -22,8 +29,14 @@ static int ecg_input_pin = 14;
 
 // We choke when it's this large, but I think we need this much
 // space!
-//uint16_t samples[30 * 250];
-uint16_t samples[100];
+// #define NUM_DMA_SAMPLES 320
+#define NUM_SAMPLES 16
+
+#define THIRTY_SECONDS_OF_SAMPLES (30 * 250)
+
+uint16_t dma_buffer[NUM_DMA_SAMPLES];
+uint16_t samples[THIRTY_SECONDS_OF_SAMPLES];
+uint16_t *buff_front = dma_buffer;
 
 // Use hardware SPI (on Uno, #13, #12, #11) and the above for CS/DC
 ILI9341_t3 tft = ILI9341_t3(TFT_CS, TFT_DC);
@@ -34,12 +47,16 @@ const int max_height = 240;
 bool dma_occurred = false;  // flag to know in loop when we recieved fresh data
 
 void setup() {
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    samples[i] = 0;
+  }
 
   // setup lcd
   tft.begin(); // Initialize the display
   tft.setRotation(1); //  0 or 2) width = width, 1 or 3) width = height, swapped etc
 
-  analogReadResolution(12);
+  // I don't think this is actually doing what we want
+  // analogReadResolution(12);
 
   pinMode(ecg_input_pin, INPUT);
 
@@ -52,7 +69,9 @@ void setup() {
 
   initialize_lcd_graph();
 
+  initialize_sd_card();
 
+  if (!sd.begin(SD_CS, SPI_HALF_SPEED)) sd.initErrorHalt();
 
 }
 
@@ -62,10 +81,31 @@ void loop() {
   // neet to wait for button to be pressed?
   if (dma_occurred) {
     dma_occurred = false;
-    Serial.print("SAMPLES[0]:");
-    Serial.println(samples[0]);
+    /* Serial.print("SAMPLES:"); */
+    /* for (int i = 0; i < NUM_SAMPLES; i++) { */
+    /*   Serial.printf(" %d ", samples[i]); */
+    /* } */
+    /* Serial.println(); */
+
     update_lcd_graph();
+
+
+    // If we've collected 30 seconds of data, write to sd card
+    // note that we don't even need to be collecting data at this point
+    if (buff_front == samples + THIRTY_SECONDS_OF_SAMPLES) {
+      NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
+      char *header_template = "zsfg:  %d Hx";
+      char * header = char[30];
+      char *eof = "\nEOF";
+      NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
+    }
+
   }
+
+}
+
+// TODO
+void initialize_sd_card() {
 
 }
 
@@ -77,18 +117,27 @@ void initialize_lcd_graph() {
 
 }
 
-// TODO
-void update_lcd_graph() {
 
+
+void update_lcd_graph() {
+  tft.fillScreen(ILI9341_BLACK);
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    int val = (int)(((float) samples[i]) / 4096 * max_height);
+    tft.drawPixel(i, val, ILI9341_WHITE);
+  }
+  /* for (int i = 0; i < NUM_SAMPLES - 1; i++) { */
+  /*   int val = (int)(((float) samples[i]) / 4096 * max_height); */
+  /*   tft.drawLine(i, val, i+1, ILI9341_WHITE); */
+  /* } */
 }
 
 
 /*
 	ADC_CFG1_ADIV(2)         Divide ratio = 4 (F_BUS = 48 MHz => ADCK = 12 MHz)
-	ADC_CFG1_MODE(2)         Single ended 10 bit mode
+	ADC_CFG1_MODE()         Single ended 12 bit mode
 	ADC_CFG1_ADLSMP          Long sample time
 */
-#define ADC_CONFIG1 (ADC_CFG1_ADIV(1) | ADC_CFG1_MODE(2) | ADC_CFG1_ADLSMP)
+#define ADC_CONFIG1 (ADC_CFG1_ADIV(1) | ADC_CFG1_MODE(1) | ADC_CFG1_ADLSMP)
 
 /*
 	ADC_CFG2_MUXSEL          Select channels ADxxb
@@ -109,7 +158,8 @@ void adcInit() {
 	Serial.println("calibrated");
 
 	// Enable ADC interrupt, configure pin
-	ADC0_SC1A = ADC_SC1_AIEN | ecg_input_pin;
+	// ADC0_SC1A = ADC_SC1_AIEN | ecg_input_pin;
+    ADC0_SC1A = ADC_SC1_AIEN | channel2sc1a[3];
 	NVIC_ENABLE_IRQ(IRQ_ADC0);
 }
 
@@ -149,8 +199,6 @@ void adcCalibrate() {
 
 // we already have the frequency we want stored in sample_rate
 // which is 250.
-// 48 MHz / 128 / 10 / 1 Hz = 37500
-// #define PDB_PERIOD (F_BUS / 128 / 10 / 1)
 #define PDB_PERIOD (F_BUS / 128 / 10 / sample_rate)
 
 
@@ -186,7 +234,7 @@ void dmaInit() {
 	DMA_TCD1_SOFF = 0;
 	DMA_TCD1_SLAST = 0;
 	// Destination address
-	DMA_TCD1_DADDR = samples;
+	DMA_TCD1_DADDR = dma_buffer;
 	// Destination offset (2 byte)
 	DMA_TCD1_DOFF = 2;
 	// Restore destination address after major loop
@@ -217,22 +265,20 @@ void dmaInit() {
 
 
 void adc0_isr() {
-  // Serial.print("adc isr: ");
-  // Serial.println(millis());
-  // Serial.println(" ");
 }
 
 void pdb_isr() {
-  // Serial.print("pdb isr: ");
-  // Serial.println(millis());
   // Clear interrupt flag
   PDB0_SC &= ~PDB_SC_PDBIF;
 }
 
 void dma_ch1_isr() {
-  Serial.print("dma isr: ");
-  Serial.println(millis());
+  NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
+  for (int i = 0; i < NUM_SAMPLES; i++ && buff_front++) {
+    samples[buff_front] = dma_buffer[i];
+  }
   // Clear interrupt request for channel 1
   DMA_CINT = 1;
   dma_occurred = true;
+  NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
 }
