@@ -3,13 +3,15 @@
  */
 
 #include <Wire.h>
+#include <Time.h>
 #include <SPI.h>
 #include <SdFat.h> // enable reading SD card on TFT
 #include "ILI9341_t3.h"
 
 #define SD_CS 21
 
-static int sample_rate = 250; // in Hz
+// samle rate in hz
+#define SAMPLE_RATE 250
 
 static int ecg_input_pin = 17;
 
@@ -24,22 +26,31 @@ static const uint8_t channel2sc1a[] = {
 #define PDB_CH0C1_TOS 0x0100
 #define PDB_CH0C1_EN 0x01
 
+
+char *filename_template = "ecg_log_data_%d.csv";
+char *header_template = "zsfg:%d at %d Hx\n";
+char *log_line_template = "%d, %d, %d, %d, %d, %d, %d, %d\n";
+char *eof = "EOF";
+
 // buffer to store ADC output during dma
 
 
 // We choke when it's this large, but I think we need this much
 // space!
 // #define NUM_DMA_SAMPLES 320
-#define NUM_SAMPLES 16
+#define NUM_DMA_SAMPLES 16
 
-#define THIRTY_SECONDS_OF_SAMPLES (30 * 250)
+#define THIRTY_SECONDS_OF_SAMPLES (30 * SAMPLE_RATE)
 
 uint16_t dma_buffer[NUM_DMA_SAMPLES];
 uint16_t samples[THIRTY_SECONDS_OF_SAMPLES];
-uint16_t *buff_front = dma_buffer;
+uint16_t *buff_front = samples;
 
 // Use hardware SPI (on Uno, #13, #12, #11) and the above for CS/DC
 ILI9341_t3 tft = ILI9341_t3(TFT_CS, TFT_DC);
+
+
+SdFat sd;  // fs obj
 
 const int max_width = 320;
 const int max_height = 240;
@@ -47,7 +58,7 @@ const int max_height = 240;
 bool dma_occurred = false;  // flag to know in loop when we recieved fresh data
 
 void setup() {
-  for (int i = 0; i < NUM_SAMPLES; i++) {
+  for (int i = 0; i < NUM_DMA_SAMPLES; i++) {
     samples[i] = 0;
   }
 
@@ -94,9 +105,40 @@ void loop() {
     // note that we don't even need to be collecting data at this point
     if (buff_front == samples + THIRTY_SECONDS_OF_SAMPLES) {
       NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
-      char *header_template = "zsfg:  %d Hx";
-      char * header = char[30];
-      char *eof = "\nEOF";
+      char header[30];
+      char filename[30];
+      sprintf(header, header_template, hourFormat12(), SAMPLE_RATE);
+      sprintf(filename, filename_template, hourFormat12());
+      SdFile data_file;  // log file
+      if (!data_file.open(filename, O_WRITE | O_READ)) {
+        sd.errorHalt("opening log file failed");
+        return;
+      }
+      data_file.write(header);
+      // since there's no guarantee that the last line will have exactly
+      // 8 samples, we do the last line outside of the loop.
+      uint16_t *sample;
+      for (sample = samples;
+           sample < samples + THIRTY_SECONDS_OF_SAMPLES - 8;
+           sample +=8) {
+        char log_line[100];
+        sprintf(log_line, log_line_template, sample, sample + 1, sample + 2,
+                sample + 3, sample + 4, sample + 5, sample + 6, sample + 7);
+        data_file.write(log_line);
+      }
+      while (sample < samples + THIRTY_SECONDS_OF_SAMPLES - 1) {
+        char * templ = "%d, ";
+        char sample_text[10];
+        sprintf(sample_text, templ, sample);
+        data_file.write(sample_text);
+        sample++;
+      }
+      char * templ = "%d\n";
+      char sample_text[10];
+      sprintf(sample_text, templ, sample);
+      data_file.write(sample_text);
+      data_file.write(eof);
+      data_file.close();
       NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
     }
 
@@ -121,7 +163,7 @@ void initialize_lcd_graph() {
 
 void update_lcd_graph() {
   tft.fillScreen(ILI9341_BLACK);
-  for (int i = 0; i < NUM_SAMPLES; i++) {
+  for (int i = 0; i < NUM_DMA_SAMPLES; i++) {
     int val = (int)(((float) samples[i]) / 4096 * max_height);
     tft.drawPixel(i, val, ILI9341_WHITE);
   }
@@ -199,7 +241,7 @@ void adcCalibrate() {
 
 // we already have the frequency we want stored in sample_rate
 // which is 250.
-#define PDB_PERIOD (F_BUS / 128 / 10 / sample_rate)
+#define PDB_PERIOD (F_BUS / 128 / 10 / SAMPLE_RATE)
 
 
 void pdbInit() {
@@ -274,8 +316,8 @@ void pdb_isr() {
 
 void dma_ch1_isr() {
   NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
-  for (int i = 0; i < NUM_SAMPLES; i++ && buff_front++) {
-    samples[buff_front] = dma_buffer[i];
+  for (int i = 0; i < NUM_DMA_SAMPLES; i++ && buff_front++) {
+    *buff_front = dma_buffer[i];
   }
   // Clear interrupt request for channel 1
   DMA_CINT = 1;
