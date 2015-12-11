@@ -1,5 +1,5 @@
 /* Zach Simon Francis Ge (zbsimon, fge3)
- * CSE 466 lab 8
+ * CSE 466 Final Project
  */
 
 #include <Wire.h>
@@ -33,17 +33,18 @@ char *header_template = "zsfg: %d at %d Hz\n";
 char *log_line_template = "%hu, %hu, %hu, %hu, %hu, %hu, %hu, %hu\n";
 char *eof = "EOF";
 
-// We choke when it's this large, but I think we need this much
-// space!
 #define NUM_DMA_SAMPLES 16
 #define NUM_SAMPLES (30 * SAMPLE_RATE)
+
+#define SAMPLES_TO_AVERAGE 3
 
 uint16_t dma_buffer[NUM_DMA_SAMPLES]; // Buffer used to store ADC data
 uint16_t samples[NUM_SAMPLES]; // Buffer that stores 30 seconds of data
 uint16_t sd_data[NUM_SAMPLES]; // to store data read from sd card
-uint16_t* buff_front = samples; // Pointer to where we are writing
-uint16_t* baseRead = samples; // Pointer to the beginning of the chunk we are drawing
-uint16_t* readIndex = samples; // Pointer to the part of the chunk we are drawing
+uint16_t* buff_front = samples; // Pointer to where we are writing in raw data
+uint16_t* sd_buff_front = sd_data; // Pointer to where we are writing in sd/avg buff
+uint16_t* baseRead = sd_data; // Pointer to the beginning of the chunk we are drawing
+uint16_t* readIndex = sd_data; // Pointer to the part of the chunk we are drawing
 
 const int SAMPLES_TO_DRAW = 320;
 const int BASELINE = 2000;
@@ -58,6 +59,13 @@ int HLineHeights[NUM_HLINES];
 bool VLinePositions[SCREEN_WIDTH];
 bool stabilized = false;
 bool writeToSDCard = false;
+
+// the endpoint of the line segment we're currently plotting
+int last_height = 0;
+
+// our buffer that stores the approximate 2nd deriv wrt t
+uint16_t sample_acceleration[SAMPLES_TO_DRAW];
+
 
 // Use hardware SPI (on Uno, #13, #12, #11) and the above for CS/DC
 ILI9341_t3 tft = ILI9341_t3(TFT_CS, TFT_DC);
@@ -111,14 +119,15 @@ void setup() {
   display_stabilization_screen();
   // Initialize SD Card
   initialize_sd_card();
-  change_state(MENU);
-  //change_state(RECORD);
+  //change_state(MENU);
+  change_state(RECORD);
 }
 
 
 
 void loop () {
-  //record_ekg_data();
+  //Serial.printf("current_state: %d\n", current_state);
+  // record_ekg_data();
   if (current_state == MENU) {
     display_options();
   } else if (current_state == REPLAY) {
@@ -179,8 +188,10 @@ void copy_file_to_sample_buff(int current_line) {
 
 
 void record_ekg_data() {
-  if (stabilized)
+  if (stabilized) {
+    filterData();
     drawColumn();
+  }
 
   // need to wait for data to stabilize?
   // neet to wait for button to be pressed?
@@ -189,6 +200,142 @@ void record_ekg_data() {
     beginWriteToSDCard();
   }
 }
+
+uint16_t filter_aux_buff[SAMPLES_TO_DRAW];
+
+void filterData() {
+
+  /*
+
+    ALSO NEED TO INCREMENT SD_BUFF_FRONT like readindex is in drawCOl:
+
+  // Advance the readIndex
+  readIndex++;
+  // If we'd read X amount past the base, advance the base
+  // Basically so we're reading a chunk of data at a time
+  if (readIndex >= baseRead + SAMPLES_TO_DRAW) {
+    baseRead = buff_front - SAMPLES_TO_DRAW;
+    readIndex = baseRead;
+  }
+
+   */
+
+
+  // ensure we have 320 samples ...
+  if (stabilized && buff_front - samples > SAMPLES_TO_DRAW) {
+    // I don't want to disable interrupts this whole time but...
+    NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
+
+    memcpy(filter_aux_buff, buff_front - SAMPLES_TO_DRAW, SAMPLES_TO_DRAW);
+    NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
+
+    //memcpy(sd_buff_front - SAMPLES_TO_DRAW, filter_aux_buff, SAMPLES_TO_DRAW);
+    blur_filter(filter_aux_buff, sd_buff_front, SAMPLES_TO_DRAW);
+    calc_sample_accel_est(sd_buff_front - SAMPLES_TO_DRAW,
+                          sample_acceleration, SAMPLES_TO_DRAW);
+    update_hr_estimate(SAMPLES_TO_DRAW);
+  }
+
+}
+
+
+void blur_filter(uint16_t *src, uint16_t *dst, int length) {
+  // 1d convolution with [.333, .333, .333]
+  double filter[3] = {0.333, 0.333, 0.333};
+  int order = 3;
+  int half = order / 2;
+  for (int i = 0; i < length; i++) {
+    double new_reading = 0;
+    int filter_index = 0;
+    for (int j = i - half; j <= i + half; j++) {
+      // handle boundary conditionss
+      int index = j;
+      if (index < 0) {
+        index = 0;
+      } else if (index > length) {
+        index = length - 1;
+      }
+      new_reading += src[index] * filter[filter_index];
+      filter_index++;
+    }
+    dst[i] = new_reading;
+  }
+}
+
+boolean local_maxes[SCREEN_WIDTH];
+uint16_t avg_accel = BASELINE;
+uint16_t samples_to_avg = 5;
+uint16_t accel_threshhold = 40;
+
+void calc_sample_accel_est(uint16_t * src, uint16_t * dst, int length) {
+  // 1d convolution with [1, -2, 1]
+  double filter[3] = {1, -2, 1};
+  int order = 3;
+  int half = order / 2;
+  for (int i = 0; i < length; i++) {
+    double new_reading = 0;
+    int filter_index = 0;
+    for (int j = i - half; j <= i + half; j++) {
+      // handle boundary conditions
+      int index = j;
+      if (index < 0) {
+        index = 0;
+      } else if (index > length) {
+        index = length - 1;
+      }
+      new_reading += src[index] * filter[filter_index];
+      filter_index++;
+    }
+    dst[i] = new_reading;
+  }
+
+  for (int i = 0; i < length; i++) {
+    dst[i] += BASELINE;
+  }
+
+  // now, detect "peak", or s waves.
+  for (int i = 0; i < length; i++) {
+    uint16_t accel_reading = src[i];
+    avg_accel = (avg_accel * samples_to_avg + accel_reading - avg_accel) / samples_to_avg;
+    uint16_t differential = avg_accel - accel_reading;
+    local_maxes[i] = differential > accel_threshhold;
+  }
+  for (int i = 0; i < length - 1; i++) {
+    if (local_maxes[i + 1] && local_maxes[i]) {
+      local_maxes[i] = false;
+    }
+  }
+
+  /* for (int i = 0; i < length; i ++) { */
+  /*   if (local_maxes[i]) { */
+  /*     tft.drawLine(i, 0, i, SCREEN_HEIGHT, ILI9341_BLUE); */
+  /*   } */
+  /* } */
+}
+
+
+double heartrate = 0; // our running average
+void update_hr_estimate(int length) {
+  uint16_t prev_peak_index = -1;
+  for (int i = 0; i < length - 1; i++) {
+    if (local_maxes[i]) {
+      if (prev_peak_index == -1) {
+        prev_peak_index = i;
+      } else {
+        double difference = i - prev_peak_index;
+        double time_per_sample = 1 / 250;
+        double delta_t = difference * time_per_sample;
+        double freq_min = 60 / delta_t;
+        Serial.printf("delta_t: %d\n", delta_t);
+        heartrate = (heartrate * 2 + freq_min - heartrate) / 2;
+        prev_peak_index = i;
+      }
+    }
+  }
+  Serial.printf("HR est: %f bpm\n", heartrate);
+}
+
+
 
 void initialize_sd_card() {
   if (!sd.begin(SD_CS, SPI_HALF_SPEED)) sd.initErrorHalt();
@@ -202,14 +349,14 @@ void beginWriteToSDCard() {
       NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
       char header[30];
       char filename[30];
-      randomSeed(millis());
+      Serial.println("there");
       int new_uid = increment_number_of_files();
+      Serial.println("here");
       sprintf(header, header_template, new_uid, SAMPLE_RATE);
       sprintf(filename, filename_template, new_uid);
-      Serial.println(header);
-      Serial.println(filename);
       SdFile data_file;  // log file
       if (!data_file.open(filename, O_WRITE | O_READ | O_CREAT)) {
+        NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
         sd.errorHalt("opening log file failed");
         return;
       }
@@ -217,15 +364,17 @@ void beginWriteToSDCard() {
       // since there's no guarantee that the last line will have exactly
       // 8 samples, we do the last line outside of the loop.
       uint16_t *sample;
-      for (sample = samples;
+      for (sample = sd_data;
            sample < samples + NUM_SAMPLES - 8;
            sample +=8) {
         char log_line[100];
-        sprintf(log_line, log_line_template, sample[0], sample[1], sample[2],
-                sample[3], sample[4], sample[5], sample[6], sample[7]);
+        Serial.println("here");
+        sprintf(log_line, log_line_template, sd_data[0], sd_data[1], sd_data[2],
+                sd_data[3], sd_data[4], sd_data[5], sd_data[6], sd_data[7]);
         data_file.write(log_line);
       }
-      while (sample < samples + NUM_SAMPLES - 1) {
+      Serial.println("here");
+      while (sample < sd_data + NUM_SAMPLES - 1) {
         char * templ = "%hu, ";
         char sample_text[10];
         sprintf(sample_text, templ, *sample);
@@ -236,11 +385,11 @@ void beginWriteToSDCard() {
       char sample_text[10];
       sprintf(sample_text, templ, *sample);
       data_file.write(sample_text);
-      Serial.println(sample_text);
       data_file.write(eof);
       data_file.sync();
       data_file.close();
-      change_state(MENU);
+      data_file.sync();
+      // change_state(MENU);
       NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
     }
 }
@@ -268,12 +417,13 @@ void reset_data() {
   }
 
   buff_front = samples;
-  baseRead = buff_front;
+  baseRead = sd_data;
   readIndex = baseRead;
   stabilized = false;
 }
 
 void display_stabilization_screen() {
+  Serial.println("***stabliization screen ******");
   tft.fillScreen(ILI9341_WHITE);
   tft.setRotation(3);
   tft.setTextSize(3);
@@ -287,9 +437,11 @@ void drawColumn() {
 
   // If the buff_front causes readIndex to be behind the front of the buffer,
   // wrap it around from the end of the buffer
-  if (readIndex < samples) {
-    readIndex = (samples + SAMPLES_TO_DRAW) - (samples - readIndex);
+  if (readIndex < sd_data) {
+    readIndex = (sd_data + SAMPLES_TO_DRAW) - (sd_data - readIndex);
   }
+
+  Serial.printf("readIndex: %d\n", readIndex - sd_data);
 
   // Get the sample
   int sample = *readIndex;
@@ -303,6 +455,7 @@ void drawColumn() {
   if (differenceFromBase < 0) height -= normalizedDiff;
   else height += normalizedDiff;
 
+
   // The current number of samples we've read since the baseRead
   int samplesRead = SAMPLES_TO_DRAW - ((baseRead + SAMPLES_TO_DRAW) - readIndex);
 
@@ -311,18 +464,37 @@ void drawColumn() {
     tft.fillRect(0, samplesRead, 240, 1, ILI9341_RED);
   else
     tft.fillRect(0, samplesRead, 240, 1, ILI9341_WHITE);
+
   for (int i = 0; i < NUM_HLINES; i++) {
     tft.drawPixel(HLineHeights[i], samplesRead, ILI9341_RED);
   }
-  // Draw the graph
+
+
+  // plot the sample on the graph.
+  //tft.fillScreen(ILI9341_BLACK);
   tft.fillRect(height, samplesRead, 3, 3, ILI9341_BLACK);
+  // NOTE WE REALLY WANT TO DRAW FROM sd_data, SO...
+  //   sample/readIndex should reference sd_data, not samples.
+  //if (readIndex = (samples + SAMPLES_TO_DRAW) - (samples - readIndex)) {
+
+  /* if (samplesRead % (2 * SAMPLES_TO_AVERAGE) == 0) { */
+
+  /* } */
+
+
+  /* if (samplesRead > SAMPLES_TO_DRAW - 1) { */
+  /*   tft.fillRect(height, samplesRead, 5, 5, ILI9341_GREEN); */
+  /* } else if (samplesRead > 0) { */
+  /*   tft.drawLine(last_height, samplesRead - 1, height, samplesRead, ILI9341_BLACK); */
+  /* } */
+  /* last_height = height; */
 
   // Advance the readIndex
   readIndex++;
   // If we'd read X amount past the base, advance the base
   // Basically so we're reading a chunk of data at a time
   if (readIndex >= baseRead + SAMPLES_TO_DRAW) {
-    baseRead = buff_front - SAMPLES_TO_DRAW;
+    baseRead = sd_buff_front - SAMPLES_TO_DRAW;
     readIndex = baseRead;
   }
 
@@ -464,19 +636,23 @@ void pdb_isr() {
   PDB0_SC &= ~PDB_SC_PDBIF;
 }
 
+
 void dma_ch1_isr() {
   NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
   for (int i = 0; i < NUM_DMA_SAMPLES; i++) {
     *buff_front = dma_buffer[i];
     buff_front++;
     // Stabilize after getting 320 samples
-    if (buff_front > (samples + 640)) stabilized = true;
+    if (buff_front > (samples + 640)) {
+      stabilized = true;
+    }
     // Use the buffer as a circular buffer
     if (buff_front > (samples + NUM_SAMPLES)) {
       buff_front = samples;
       writeToSDCard = true;
     }
   }
+  sd_buff_front += NUM_DMA_SAMPLES;
   // Clear interrupt request for channel 1
   DMA_CINT = 1;
   dma_occurred = true;
@@ -490,21 +666,29 @@ static char *num_files_filename = "index";
 
 int increment_number_of_files() {
   SdFile metadata;
+  Serial.println("opening metadatafile");
+
+
+
   if (!metadata.open(num_files_filename, O_WRITE | O_READ | O_CREAT)) {
     sd.errorHalt("error opening metadatafile");
   }
   char metadata_contents[10];
+  Serial.println("callling fgets");
   int res = metadata.fgets(metadata_contents, 10);
+  Serial.println("done calling fgets");
   if (res <1) {
     sd.errorHalt("error reading metadata file");
   }
   int count = atoi(metadata_contents) + 1;
   char new_contents[20];
+  Serial.printf("count: %d\n", count);
   sprintf(new_contents, "%d", count);
   metadata.rewind();
   metadata.write(new_contents, strlen(new_contents));
   metadata.sync();
   metadata.close();
+  metadata.sync();
   return count;
 }
 
