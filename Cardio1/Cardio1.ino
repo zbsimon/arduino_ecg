@@ -5,6 +5,8 @@
 #include <Wire.h>
 #include <Time.h>
 #include <SPI.h>
+#include <Bounce.h>
+#include <string.h>
 #include <SdFat.h> // enable reading SD card on TFT
 #include "ILI9341_t3.h"
 
@@ -27,8 +29,8 @@ static const uint8_t channel2sc1a[] = {
 #define PDB_CH0C1_EN 0x01
 
 char *filename_template = "ecg_log_data_%d.csv";
-char *header_template = "zsfg:%d at %d Hx\n";
-char *log_line_template = "%d, %d, %d, %d, %d, %d, %d, %d\n";
+char *header_template = "zsfg: %d at %d Hz\n";
+char *log_line_template = "%hu, %hu, %hu, %hu, %hu, %hu, %hu, %hu\n";
 char *eof = "EOF";
 
 // We choke when it's this large, but I think we need this much
@@ -38,6 +40,7 @@ char *eof = "EOF";
 
 uint16_t dma_buffer[NUM_DMA_SAMPLES]; // Buffer used to store ADC data
 uint16_t samples[NUM_SAMPLES]; // Buffer that stores 30 seconds of data
+uint16_t sd_data[NUM_SAMPLES]; // to store data read from sd card
 uint16_t* buff_front = samples; // Pointer to where we are writing
 uint16_t* baseRead = samples; // Pointer to the beginning of the chunk we are drawing
 uint16_t* readIndex = samples; // Pointer to the part of the chunk we are drawing
@@ -60,19 +63,42 @@ bool writeToSDCard = false;
 ILI9341_t3 tft = ILI9341_t3(TFT_CS, TFT_DC);
 
 SdFat sd;  // fs obj
+SdFile root;
 
 const int max_width = 320;
 const int max_height = 240;
 
 bool dma_occurred = false;  // flag to know in loop when we recieved fresh data
 
+// joystick setup
+#define Y_PIN 22
+#define B_PIN 21
+
+boolean last_button_state = false;
+volatile uint16_t y_val = 0;
+static long debounce_delay = 50;
+
+Bounce joystick_button = Bounce(B_PIN, debounce_delay);
+
+
+#define MENU 1
+#define RECORD 2
+#define REPLAY 3
+
+volatile int current_line = 0;
+volatile int current_state = MENU;
+boolean first_display = true;
+
+
 void setup() {
   // Initialize Pins
   pinMode(ecg_input_pin, INPUT);
+  pinMode(Y_PIN, INPUT);
+  pinMode(B_PIN, INPUT_PULLUP);
 
   // Initialize Serial and wait for Serial
   Serial.begin(9600);
-  // while (!Serial);
+  while (!Serial);
 
   // Initialize PDB/ADC/DMA
   pdbInit();
@@ -83,12 +109,76 @@ void setup() {
   reset_data();
   initialize_lcd_graph();
   display_stabilization_screen();
-
   // Initialize SD Card
   initialize_sd_card();
+  change_state(MENU);
+  //change_state(RECORD);
 }
 
-void loop() {
+
+
+void loop () {
+  //record_ekg_data();
+  if (current_state == MENU) {
+    display_options();
+  } else if (current_state == REPLAY) {
+    replay_ekg_data(current_line);
+  } else {
+    record_ekg_data();
+  }
+}
+
+void replay_ekg_data(int file) {
+    copy_file_to_sample_buff(current_line);
+    Serial.print("done copying sd data in");
+}
+
+void change_state(int new_state) {
+  if (new_state == MENU) {
+    //NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
+    first_display = true;
+    current_state = MENU;
+  } else if (new_state == RECORD) {
+    reset_data();
+    display_stabilization_screen();
+    //NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
+    current_state = RECORD;
+  } else if (new_state == REPLAY) {
+    //NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
+    current_state = REPLAY;
+  }
+}
+
+static char newline_delim[] = "\n";
+static char subline_delim[] = ", \n";
+
+void copy_file_to_sample_buff(int current_line) {
+  char filename[50];
+  sprintf(filename, filename_template, current_line);
+  SdFile current_file;
+  if (current_file.open(filename, O_WRITE | O_READ | O_CREAT)) {
+    sd.errorHalt("error opening log file");
+  }
+  uint16_t * current_sample = sd_data;
+  char line_buff[100];
+  char *next_token;
+  char *tmp;
+  int res = current_file.fgets(line_buff, 100, newline_delim);
+  for (int i = 0; i < NUM_SAMPLES / 8 + 1; i++) {
+    int res = current_file.fgets(line_buff, 100, newline_delim);
+    next_token = strtok_r(line_buff, subline_delim, &tmp);
+    while (next_token != NULL) {
+      *current_sample = atoi(next_token);
+      current_sample++;
+      next_token = strtok_r(NULL, subline_delim, &tmp);
+    }
+  }
+  current_file.close();
+}
+
+
+
+void record_ekg_data() {
   if (stabilized)
     drawColumn();
 
@@ -100,22 +190,22 @@ void loop() {
   }
 }
 
-// TODO
 void initialize_sd_card() {
   if (!sd.begin(SD_CS, SPI_HALF_SPEED)) sd.initErrorHalt();
+  sd.vwd()->rewind();
 }
 
 void beginWriteToSDCard() {
-    // If we've collected 30 seconds of data, write to sd card
-    // note that we don't even need to be collecting data at this point
-    if (writeToSDCard) {
+    if (writeToSDCard && current_state == RECORD) {
       writeToSDCard = false;
       Serial.println("Writing to SD CArd");
       NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
       char header[30];
       char filename[30];
-      sprintf(header, header_template, hourFormat12(), SAMPLE_RATE);
-      sprintf(filename, filename_template, hourFormat12());
+      randomSeed(millis());
+      int new_uid = increment_number_of_files();
+      sprintf(header, header_template, new_uid, SAMPLE_RATE);
+      sprintf(filename, filename_template, new_uid);
       Serial.println(header);
       Serial.println(filename);
       SdFile data_file;  // log file
@@ -131,25 +221,26 @@ void beginWriteToSDCard() {
            sample < samples + NUM_SAMPLES - 8;
            sample +=8) {
         char log_line[100];
-        sprintf(log_line, log_line_template, sample, sample + 1, sample + 2,
-                sample + 3, sample + 4, sample + 5, sample + 6, sample + 7);
+        sprintf(log_line, log_line_template, sample[0], sample[1], sample[2],
+                sample[3], sample[4], sample[5], sample[6], sample[7]);
         data_file.write(log_line);
       }
       while (sample < samples + NUM_SAMPLES - 1) {
-        char * templ = "%d, ";
+        char * templ = "%hu, ";
         char sample_text[10];
-        sprintf(sample_text, templ, sample);
-        Serial.println(sample_text);
+        sprintf(sample_text, templ, *sample);
         data_file.write(sample_text);
         sample++;
       }
-      char * templ = "%d\n";
+      char * templ = "%hu\n";
       char sample_text[10];
-      sprintf(sample_text, templ, sample);
+      sprintf(sample_text, templ, *sample);
       data_file.write(sample_text);
       Serial.println(sample_text);
       data_file.write(eof);
+      data_file.sync();
       data_file.close();
+      change_state(MENU);
       NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
     }
 }
@@ -193,6 +284,7 @@ void display_stabilization_screen() {
 }
 
 void drawColumn() {
+
   // If the buff_front causes readIndex to be behind the front of the buffer,
   // wrap it around from the end of the buffer
   if (readIndex < samples) {
@@ -201,6 +293,7 @@ void drawColumn() {
 
   // Get the sample
   int sample = *readIndex;
+
   // Get the difference from the baseline
   int differenceFromBase = sample - BASELINE;
   // Turn this into pixels
@@ -373,7 +466,6 @@ void pdb_isr() {
 
 void dma_ch1_isr() {
   NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
-
   for (int i = 0; i < NUM_DMA_SAMPLES; i++) {
     *buff_front = dma_buffer[i];
     buff_front++;
@@ -390,4 +482,130 @@ void dma_ch1_isr() {
   dma_occurred = true;
 
   NVIC_ENABLE_IRQ(IRQ_DMA_CH1);
+}
+
+
+// FS code
+static char *num_files_filename = "index";
+
+int increment_number_of_files() {
+  SdFile metadata;
+  if (!metadata.open(num_files_filename, O_WRITE | O_READ | O_CREAT)) {
+    sd.errorHalt("error opening metadatafile");
+  }
+  char metadata_contents[10];
+  int res = metadata.fgets(metadata_contents, 10);
+  if (res <1) {
+    sd.errorHalt("error reading metadata file");
+  }
+  int count = atoi(metadata_contents) + 1;
+  char new_contents[20];
+  sprintf(new_contents, "%d", count);
+  metadata.rewind();
+  metadata.write(new_contents, strlen(new_contents));
+  metadata.sync();
+  metadata.close();
+  return count;
+}
+
+
+
+void display_options() {
+  int move_cursor = scroll_direction();
+  int num_logs = get_number_of_files();
+  if (move_cursor == -1 && current_line < num_logs) {
+    current_line++;
+  } else if (move_cursor == 1 && current_line > 0)  {
+    current_line--;
+  }
+
+  if (button_pressed()) {
+    stabilized = false;
+    tft.fillScreen(ILI9341_WHITE);
+    if (current_line == 0) {
+      change_state(RECORD);
+    } else {
+      change_state(REPLAY);
+    }
+    tft.setRotation(2);
+    return;
+  }
+
+  if (move_cursor || first_display) {
+    first_display = false;
+    tft.setRotation(3);
+    tft.setCursor(5, 0);
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_BLACK);
+    tft.fillScreen(ILI9341_WHITE);
+    if (current_line == 0){
+      tft.setTextColor(ILI9341_RED);
+      tft.println("record ekg data");
+      tft.setTextColor(ILI9341_BLACK);
+    } else {
+      tft.println("record ekg data");
+    }
+
+    for (int i = 1; i <= num_logs; i++) {
+      if (current_line == i) {
+        tft.setTextColor(ILI9341_RED);
+        tft.printf("view ecg_log_data_%d.csv\n", i);
+        tft.setTextColor(ILI9341_BLACK);
+      } else {
+        tft.printf("view ecg_log_data_%d.csv\n", i);
+      }
+
+    }
+    tft.setRotation(2);
+  }
+}
+
+int get_number_of_files() {
+  SdFile metadata;
+  if (!metadata.open(num_files_filename, O_WRITE | O_READ | O_CREAT)) {
+    sd.errorHalt("error opening metadatafile");
+  }
+  char metadata_contents[10];
+  int res = metadata.fgets(metadata_contents, 10);
+  if (res <1) {
+    sd.errorHalt("error reading metadata file");
+  }
+  int count = atoi(metadata_contents);
+
+  metadata.close();
+  return count;
+}
+
+
+// button / joystick code
+int old_scroll_state = 0;
+// -1 = down, 0 = no scroll, 1 = up
+int scroll_direction() {
+  int val = analogRead(Y_PIN);
+  int new_state = 0;
+  if (val < 500) {
+    new_state = 1;
+  } else if (val > 3300) {
+    new_state = -1;
+  }
+  /* Serial.printf("New state: %d \n", new_state); */
+  /* Serial.printf("Old scroll state; %d \n", old_scroll_state); */
+  int reading = 0;
+  if (new_state == 1 && old_scroll_state != 1) {
+    reading = 1;
+  } else if (new_state == -1 && old_scroll_state != -1) {
+    reading = -1;
+  } else {
+    reading = 0;
+  }
+  old_scroll_state = new_state;
+  return reading;
+}
+
+boolean button_pressed() {
+  if (joystick_button.update() && joystick_button.fallingEdge()) {
+    return true;
+  } else {
+    return false;
+  }
 }
