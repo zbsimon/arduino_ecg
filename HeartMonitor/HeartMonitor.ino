@@ -312,8 +312,11 @@ void drawColumn() {
     }
   }
 
-  // Advance the readIndex
-  readIndex++;
+  // Advance the readIndex, but only if we're not viewing a log file.
+  if (current_state != REPLAY) {
+    readIndex++;
+  }
+
   // If we'd read X amount past the base, advance the base
   // Basically so we're reading a chunk of data at a time
   if (readIndex >= baseRead + SAMPLES_TO_DRAW) {
