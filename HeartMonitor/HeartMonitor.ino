@@ -628,16 +628,23 @@ void dmaInit() {
 
 // Our interrupt service handlers:
 
+// run when adc is done.
 void adc0_isr() {
   // nothing to do here
 }
 
+// run when timer fires
+// (only need to clear flags b/c adc starts automatically)
 void pdb_isr() {
   // Clear interrupt flag
   PDB0_SC &= ~PDB_SC_PDBIF;
 }
 
+
+// run when DMA is complete (i.e. we have new samples in our buffer)
 void dma_ch1_isr() {
+
+  // disable interrupts so we aren't pre-empted.
   NVIC_DISABLE_IRQ(IRQ_DMA_CH1);
 
 
@@ -647,7 +654,7 @@ void dma_ch1_isr() {
     buff_front++;
     // Stabilize after getting 320 samples
     if (buff_front > (samples + 320)) stabilized = true;
-    // Use the buffer as a circular buffer
+    // Use the buffer as a circular buffer, i.e. wrap if needed.
     if (buff_front > (samples + NUM_SAMPLES)) {
       buff_front = samples;
       writeToSDCard = true;
